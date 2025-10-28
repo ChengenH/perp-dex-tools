@@ -131,3 +131,11 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+# python3 -m venv env
+# source env/bin/activate
+# tmux new -s runbot
+# python runbot.py --exchange extended --ticker BTC --quantity 0.001 --take-profit 0.005 --max-orders 14 --wait-time 450
+#退出 Ctrl+B 然后 D
+#恢复 tmux attach -t runbot
+#杀掉进程  tmux kill-session -t runbot
