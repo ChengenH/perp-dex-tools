@@ -678,6 +678,14 @@ class HedgeBot:
                 await asyncio.sleep(5)
                 # ensure previous order fully inactive
                 await self._wait_edgex_order_inactive(order_id)
+                # if position已满足目标方向，则不再重下
+                try:
+                    pos_amt = await self.edgex_client.get_account_positions()
+                except Exception:
+                    pos_amt = abs(self.edgex_position)
+                if (side == 'sell' and self.edgex_position <= 0) or (side == 'buy' and self.edgex_position >= 0):
+                    self.logger.info("Skip re-place: position already satisfied after cancel")
+                    break
                 async with self.edgex_order_lock:
                     order_id, order_price = await self.place_bbo_order(side, quantity)
                 start_time = time.time()
@@ -712,6 +720,14 @@ class HedgeBot:
                             last_cancel_time = current_time
                             await self._wait_edgex_order_inactive(order_id)
                             await asyncio.sleep(5)
+                            # 二次检查是否还需要同向重下
+                            try:
+                                pos_amt = await self.edgex_client.get_account_positions()
+                            except Exception:
+                                pos_amt = abs(self.edgex_position)
+                            if (side == 'sell' and self.edgex_position <= 0) or (side == 'buy' and self.edgex_position >= 0):
+                                self.logger.info("Skip re-place after TTL: position already satisfied")
+                                continue
                             async with self.edgex_order_lock:
                                 order_id, order_price = await self.place_bbo_order(side, quantity)
                             start_time = time.time()
@@ -731,6 +747,14 @@ class HedgeBot:
                                 await self._wait_edgex_order_inactive(order_id)
                                 # wait 5s before re-placing a fresh post-only order at latest price
                                 await asyncio.sleep(5)
+                                # 二次检查是否还需要同向重下
+                                try:
+                                    pos_amt = await self.edgex_client.get_account_positions()
+                                except Exception:
+                                    pos_amt = abs(self.edgex_position)
+                                if (side == 'sell' and self.edgex_position <= 0) or (side == 'buy' and self.edgex_position >= 0):
+                                    self.logger.info("Skip re-place after price-mismatch: position already satisfied")
+                                    continue
                                 async with self.edgex_order_lock:
                                     order_id, order_price = await self.place_bbo_order(side, quantity)
                                 # reset timer window after new order
