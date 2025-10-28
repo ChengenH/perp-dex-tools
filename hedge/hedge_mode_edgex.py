@@ -10,7 +10,11 @@ import argparse
 import traceback
 import csv
 from decimal import Decimal
-from typing import Tuple
+from typing import Tuple, Optional, Dict, Any
+from dataclasses import dataclass
+from enum import Enum
+import threading
+from collections import defaultdict
 
 from lighter.signer_client import SignerClient
 import sys
@@ -26,6 +30,63 @@ import dotenv
 dotenv.load_dotenv()
 
 
+class OrderStatus(Enum):
+    """Order status enumeration."""
+    NEW = "NEW"
+    OPEN = "OPEN"
+    PENDING = "PENDING"
+    CANCELING = "CANCELING"
+    CANCELED = "CANCELED"
+    CANCELLED = "CANCELLED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+
+
+class OrderSide(Enum):
+    """Order side enumeration."""
+    BUY = "buy"
+    SELL = "sell"
+
+
+@dataclass
+class TradingConfig:
+    """Trading configuration parameters."""
+    ticker: str
+    order_quantity: Decimal
+    fill_timeout: int = 5
+    iterations: int = 20
+    edgex_ttl_seconds: int = 30
+    price_adjustment_threshold: int = 5  # ticks
+    max_price_adjustments: int = 2
+    rate_limit_interval: float = 6.0
+    waiting_log_interval: float = 10.0
+
+
+@dataclass
+class PerformanceMetrics:
+    """Performance tracking metrics."""
+    orders_placed: int = 0
+    orders_filled: int = 0
+    orders_canceled: int = 0
+    total_latency_ms: float = 0.0
+    edgex_api_calls: int = 0
+    lighter_api_calls: int = 0
+    websocket_reconnects: int = 0
+    errors: int = 0
+    price_adjustments: int = 0
+    start_time: float = 0.0
+    
+    def __post_init__(self):
+        self.start_time = time.time()
+    
+    def get_runtime_seconds(self) -> float:
+        return time.time() - self.start_time
+    
+    def get_orders_per_minute(self) -> float:
+        runtime = self.get_runtime_seconds()
+        return (self.orders_placed / runtime * 60) if runtime > 0 else 0.0
+
+
 class Config:
     """Simple config class to wrap dictionary for EdgeX client."""
     def __init__(self, config_dict):
@@ -33,31 +94,83 @@ class Config:
             setattr(self, key, value)
 
 
+class TradingError(Exception):
+    """Base exception for trading-related errors."""
+    pass
+
+
+class OrderError(TradingError):
+    """Exception raised for order-related errors."""
+    pass
+
+
+class NetworkError(TradingError):
+    """Exception raised for network-related errors."""
+    pass
+
+
+class RateLimitError(TradingError):
+    """Exception raised for rate limit errors."""
+    pass
+
+
+class ErrorHandler:
+    """Centralized error handling and recovery."""
+    
+    def __init__(self, logger: logging.Logger, metrics: PerformanceMetrics):
+        self.logger = logger
+        self.metrics = metrics
+    
+    def handle_error(self, error: Exception, context: str = "") -> bool:
+        """Handle an error and return whether to retry."""
+        self.metrics.errors += 1
+        
+        if isinstance(error, RateLimitError):
+            self.logger.warning(f"Rate limit hit: {error}")
+            return True
+        elif isinstance(error, NetworkError):
+            self.logger.warning(f"Network error: {error}")
+            return True
+        elif isinstance(error, OrderError):
+            self.logger.error(f"Order error: {error}")
+            return False
+        else:
+            self.logger.error(f"Unexpected error in {context}: {error}")
+            return False
+
+
 class HedgeBot:
     """Trading bot that places post-only orders on EdgeX and hedges with market orders on Lighter."""
 
-    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20):
-        self.ticker = ticker
-        self.order_quantity = order_quantity
-        self.fill_timeout = fill_timeout
+    def __init__(self, config: TradingConfig):
+        self.config = config
+        self.ticker = config.ticker
+        self.order_quantity = config.order_quantity
+        self.fill_timeout = config.fill_timeout
         self.lighter_order_filled = False
-        self.iterations = iterations
+        self.iterations = config.iterations
         self.edgex_position = Decimal('0')
         self.lighter_position = Decimal('0')
         self.current_order = {}
-
+        
+        # Performance tracking
+        self.metrics = PerformanceMetrics()
+        
         # Initialize logging to file
         os.makedirs("logs", exist_ok=True)
-        self.log_filename = f"logs/edgex_{ticker}_hedge_mode_log.txt"
-        self.csv_filename = f"logs/edgex_{ticker}_hedge_mode_trades.csv"
+        self.log_filename = f"logs/edgex_{self.ticker}_hedge_mode_log.txt"
+        self.csv_filename = f"logs/edgex_{self.ticker}_hedge_mode_trades.csv"
         self.original_stdout = sys.stdout
 
         # Initialize CSV file with headers if it doesn't exist
         self._initialize_csv_file()
 
         # Setup logger
-        self.logger = logging.getLogger(f"hedge_bot_{ticker}")
+        self.logger = logging.getLogger(f"hedge_bot_{self.ticker}")
         self.logger.setLevel(logging.INFO)
+        
+        # Initialize error handler
+        self.error_handler = ErrorHandler(self.logger, self.metrics)
 
         # Clear any existing handlers to avoid duplicates
         self.logger.handlers.clear()
@@ -156,6 +269,9 @@ class HedgeBot:
         """Graceful shutdown handler."""
         self.stop_flag = True
         self.logger.info("\n🛑 Stopping...")
+        
+        # Print performance report
+        self.print_performance_report()
 
         # Cancel Lighter WebSocket task
         if self.lighter_ws_task and not self.lighter_ws_task.done():
@@ -172,6 +288,27 @@ class HedgeBot:
                 self.logger.removeHandler(handler)
             except Exception:
                 pass
+
+    def print_performance_report(self):
+        """Print performance metrics report."""
+        runtime = self.metrics.get_runtime_seconds()
+        orders_per_min = self.metrics.get_orders_per_minute()
+        
+        self.logger.info("=" * 60)
+        self.logger.info("📊 PERFORMANCE REPORT")
+        self.logger.info("=" * 60)
+        self.logger.info(f"Runtime: {runtime:.1f} seconds")
+        self.logger.info(f"Orders Placed: {self.metrics.orders_placed}")
+        self.logger.info(f"Orders Filled: {self.metrics.orders_filled}")
+        self.logger.info(f"Orders Canceled: {self.metrics.orders_canceled}")
+        self.logger.info(f"Fill Rate: {(self.metrics.orders_filled/max(1, self.metrics.orders_placed)*100):.1f}%")
+        self.logger.info(f"Orders/Min: {orders_per_min:.1f}")
+        self.logger.info(f"EdgeX API Calls: {self.metrics.edgex_api_calls}")
+        self.logger.info(f"Lighter API Calls: {self.metrics.lighter_api_calls}")
+        self.logger.info(f"Price Adjustments: {self.metrics.price_adjustments}")
+        self.logger.info(f"Errors: {self.metrics.errors}")
+        self.logger.info(f"WebSocket Reconnects: {self.metrics.websocket_reconnects}")
+        self.logger.info("=" * 60)
 
     def _initialize_csv_file(self):
         """Initialize CSV file with headers if it doesn't exist."""
@@ -579,6 +716,7 @@ class HedgeBot:
         )
         if order_result.success:
             self.edgex_active_order_id = order_result.order_id
+            self.metrics.orders_placed += 1
             return order_result.order_id, order_result.price
 
         # Fallback: place a single conservative maker price once (avoid rapid spam)
@@ -608,26 +746,39 @@ class HedgeBot:
             self.logger.info(f"[Fallback] EdgeX order accepted at {price} (single conservative attempt)")
             self.edgex_active_order_id = fallback_result.order_id
             self.edgex_active_side = side
+            self.edgex_order_status = OrderStatus.OPEN.value
+            self.metrics.orders_placed += 1
             return fallback_result.order_id, price
 
         last_error = fallback_result.error_message if hasattr(fallback_result, 'error_message') else 'Unknown error'
-        # If hit rate limit, wait a bit and retry once more
-        if isinstance(last_error, str) and 'rateLimit' in last_error:
-            self.logger.info("Hit EdgeX rate limit; waiting 6s and retrying fallback once")
-            await asyncio.sleep(6.0)
-            await self._edgex_rate_limit_wait()
-            retry_result = await self.edgex_client.place_close_order(
-                contract_id=self.edgex_contract_id,
-                quantity=quantity,
-                price=price,
-                side=side
-            )
-            if retry_result.success:
-                self.edgex_active_order_id = retry_result.order_id
-                self.edgex_active_side = side
-                return retry_result.order_id, price
-            last_error = retry_result.error_message if hasattr(retry_result, 'error_message') else last_error
-        raise Exception(f"Failed to place order after fallback: {last_error}")
+        
+        # Classify and handle different error types
+        if isinstance(last_error, str):
+            if 'rateLimit' in last_error.lower():
+                self.logger.info("Hit EdgeX rate limit; waiting 6s and retrying fallback once")
+                await asyncio.sleep(6.0)
+                await self._edgex_rate_limit_wait()
+                retry_result = await self.edgex_client.place_close_order(
+                    contract_id=self.edgex_contract_id,
+                    quantity=quantity,
+                    price=price,
+                    side=side
+                )
+                if retry_result.success:
+                    self.edgex_active_order_id = retry_result.order_id
+                    self.edgex_active_side = side
+                    self.edgex_order_status = OrderStatus.OPEN.value
+                    self.metrics.orders_placed += 1
+                    return retry_result.order_id, price
+                last_error = retry_result.error_message if hasattr(retry_result, 'error_message') else last_error
+            elif 'insufficient' in last_error.lower() or 'balance' in last_error.lower():
+                raise OrderError(f"Insufficient balance for EdgeX order: {last_error}")
+            elif 'invalid' in last_error.lower() or 'bad' in last_error.lower():
+                raise OrderError(f"Invalid EdgeX order parameters: {last_error}")
+            elif 'network' in last_error.lower() or 'timeout' in last_error.lower():
+                raise NetworkError(f"Network error placing EdgeX order: {last_error}")
+        
+        raise OrderError(f"Failed to place EdgeX order after fallback: {last_error}")
 
     async def _wait_edgex_order_inactive(self, order_id: str, timeout: float = 10.0):
         """Wait until the given order_id is no longer active (best-effort)."""
@@ -645,14 +796,15 @@ class HedgeBot:
             return
 
     async def _edgex_rate_limit_wait(self):
-        """Ensure EdgeX API call spacing to respect 2 ops / 2s (approx)."""
+        """Ensure EdgeX API call spacing to respect rate limits."""
         async with self.edgex_rate_limit_lock:
             now = time.time()
-            min_interval = 6.0
+            min_interval = self.config.rate_limit_interval
             delta = now - self.edgex_last_op_time
             if delta < min_interval:
                 await asyncio.sleep(min_interval - delta)
             self.edgex_last_op_time = time.time()
+            self.metrics.edgex_api_calls += 1
 
     async def place_edgex_post_only_order(self, side: str, quantity: Decimal):
         """Place a post-only order on EdgeX."""
@@ -666,10 +818,15 @@ class HedgeBot:
         self.logger.info(f"[OPEN] [EdgeX] [{side}] Placing EdgeX POST-ONLY order")
         async with self.edgex_order_lock:
             order_id, order_price = await self.place_bbo_order(side, quantity)
+            # Update order_id if fallback was used
+            if self.edgex_active_order_id and self.edgex_active_order_id != order_id:
+                order_id = self.edgex_active_order_id
 
         start_time = time.time()
         last_cancel_time = 0
-        effective_ttl_seconds = 30  # Maker order validity window
+        last_waiting_log_time = 0
+        price_adjustment_count = 0
+        effective_ttl_seconds = self.config.edgex_ttl_seconds
 
         while not self.stop_flag:
             if self.edgex_order_status in ['CANCELED', 'CANCELLED']:
@@ -701,6 +858,7 @@ class HedgeBot:
                     best_bid = None
                     best_ask = None
 
+                current_time = time.time()
                 should_cancel = False
                 if best_bid is not None and best_ask is not None:
                     # Cancel only when our limit would cross the book and变为吃单
@@ -708,8 +866,12 @@ class HedgeBot:
                         should_cancel = True
                     elif side == 'sell' and order_price <= best_bid:
                         should_cancel = True
-
-                current_time = time.time()
+                    # Also cancel if price is too close to BBO and waiting too long (15s)
+                    elif current_time - start_time > 15:
+                        if side == 'buy' and order_price >= best_ask - (self.edgex_tick_size or Decimal('0.1')):
+                            should_cancel = True
+                        elif side == 'sell' and order_price <= best_bid + (self.edgex_tick_size or Decimal('0.1')):
+                            should_cancel = True
 
                 # Hard validity window: cancel and re-place after TTL regardless of price
                 if current_time - start_time >= effective_ttl_seconds and current_time - last_cancel_time > 1:
@@ -727,7 +889,7 @@ class HedgeBot:
                                 pos_amt = abs(self.edgex_position)
                             if (side == 'sell' and self.edgex_position <= 0) or (side == 'buy' and self.edgex_position >= 0):
                                 self.logger.info("Skip re-place after TTL: position already satisfied")
-                                continue
+                                break
                             async with self.edgex_order_lock:
                                 order_id, order_price = await self.place_bbo_order(side, quantity)
                             start_time = time.time()
@@ -736,6 +898,45 @@ class HedgeBot:
                             self.logger.error(f"❌ Error canceling EdgeX order (TTL): {cancel_result.error_message}")
                     except Exception as e:
                         self.logger.error(f"❌ Error canceling EdgeX order (TTL): {e}")
+
+                # Smart price adjustment: only if waiting very long and price is far from BBO
+                # Limit to maximum price adjustments per order to avoid infinite loops
+                if (current_time - start_time > 25 and not should_cancel and 
+                    best_bid is not None and best_ask is not None and 
+                    price_adjustment_count < self.config.max_price_adjustments):
+                    # Only adjust if price is significantly far from BBO
+                    tick = self.edgex_tick_size or Decimal('0.1')
+                    threshold_ticks = self.config.price_adjustment_threshold
+                    if side == 'buy' and order_price < best_ask - tick * threshold_ticks:
+                        self.logger.info(f"Adjusting buy price from {order_price} to {best_ask - tick * 2} for faster fill (adjustment {price_adjustment_count + 1}/{self.config.max_price_adjustments})")
+                        try:
+                            # Cancel current order and place new one with better price
+                            cancel_result = await self.edgex_client.cancel_order(order_id)
+                            if cancel_result.success:
+                                await self._wait_edgex_order_inactive(order_id)
+                                await asyncio.sleep(2)  # Longer wait to avoid rapid adjustments
+                                async with self.edgex_order_lock:
+                                    order_id, order_price = await self.place_bbo_order(side, quantity)
+                                start_time = time.time()
+                                price_adjustment_count += 1
+                                continue
+                        except Exception as e:
+                            self.logger.warning(f"Failed to adjust price: {e}")
+                    elif side == 'sell' and order_price > best_bid + tick * threshold_ticks:
+                        self.logger.info(f"Adjusting sell price from {order_price} to {best_bid + tick * 2} for faster fill (adjustment {price_adjustment_count + 1}/{self.config.max_price_adjustments})")
+                        try:
+                            # Cancel current order and place new one with better price
+                            cancel_result = await self.edgex_client.cancel_order(order_id)
+                            if cancel_result.success:
+                                await self._wait_edgex_order_inactive(order_id)
+                                await asyncio.sleep(2)  # Longer wait to avoid rapid adjustments
+                                async with self.edgex_order_lock:
+                                    order_id, order_price = await self.place_bbo_order(side, quantity)
+                                start_time = time.time()
+                                price_adjustment_count += 1
+                                continue
+                        except Exception as e:
+                            self.logger.warning(f"Failed to adjust price: {e}")
 
                 if current_time - start_time > 10:
                     if should_cancel and current_time - last_cancel_time > 5:
@@ -754,7 +955,7 @@ class HedgeBot:
                                     pos_amt = abs(self.edgex_position)
                                 if (side == 'sell' and self.edgex_position <= 0) or (side == 'buy' and self.edgex_position >= 0):
                                     self.logger.info("Skip re-place after price-mismatch: position already satisfied")
-                                    continue
+                                    break
                                 async with self.edgex_order_lock:
                                     order_id, order_price = await self.place_bbo_order(side, quantity)
                                 # reset timer window after new order
@@ -764,7 +965,10 @@ class HedgeBot:
                         except Exception as e:
                             self.logger.error(f"❌ Error canceling EdgeX order: {e}")
                     elif not should_cancel:
-                        self.logger.info(f"Waiting for EdgeX order to be filled (order price is near BBO)")
+                        # Throttle waiting log based on config
+                        if current_time - last_waiting_log_time >= self.config.waiting_log_interval:
+                            self.logger.info(f"Waiting for EdgeX order to be filled (order price is near BBO)")
+                            last_waiting_log_time = current_time
             elif self.edgex_order_status == 'FILLED':
                 self.logger.info(f"Order {order_id} filled successfully")
                 break
@@ -1116,7 +1320,45 @@ def parse_arguments():
                         help='Number of iterations to run')
     parser.add_argument('--fill-timeout', type=int, default=5,
                         help='Timeout in seconds for maker order fills (default: 5)')
+    parser.add_argument('--ttl', type=int, default=30,
+                        help='EdgeX order TTL in seconds (default: 30)')
+    parser.add_argument('--rate-limit', type=float, default=6.0,
+                        help='EdgeX API rate limit interval in seconds (default: 6.0)')
+    parser.add_argument('--max-adjustments', type=int, default=2,
+                        help='Maximum price adjustments per order (default: 2)')
+    parser.add_argument('--adjustment-threshold', type=int, default=5,
+                        help='Price adjustment threshold in ticks (default: 5)')
 
     return parser.parse_args()
 
 
+def main():
+    """Main function."""
+    args = parse_arguments()
+    
+    # Create trading configuration
+    config = TradingConfig(
+        ticker=args.ticker,
+        order_quantity=Decimal(args.size) if args.size else Decimal('0.001'),
+        fill_timeout=args.fill_timeout,
+        iterations=args.iter if args.iter else 20,
+        edgex_ttl_seconds=args.ttl,
+        rate_limit_interval=args.rate_limit,
+        max_price_adjustments=args.max_adjustments,
+        price_adjustment_threshold=args.adjustment_threshold
+    )
+    
+    # Create and run bot
+    bot = HedgeBot(config)
+    
+    try:
+        asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        print("\n🛑 Bot stopped by user")
+    except Exception as e:
+        print(f"❌ Bot error: {e}")
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()

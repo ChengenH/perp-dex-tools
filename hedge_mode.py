@@ -99,14 +99,17 @@ async def main():
     
     try:
         # Create the hedge bot instance
-        if args.exchange.lower() == 'backpack':
-            bot = HedgeBotClass(
+        if args.exchange.lower() == 'edgex':
+            # EdgeX uses TradingConfig
+            from hedge.hedge_mode_edgex import TradingConfig
+            config = TradingConfig(
                 ticker=args.ticker.upper(),
                 order_quantity=Decimal(args.size),
                 fill_timeout=args.fill_timeout,
                 iterations=args.iter
             )
-        else:  # extended
+            bot = HedgeBotClass(config)
+        else:  # backpack, extended, etc.
             bot = HedgeBotClass(
                 ticker=args.ticker.upper(),
                 order_quantity=Decimal(args.size),
