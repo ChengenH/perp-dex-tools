@@ -114,6 +114,9 @@ class HedgeBot:
         self.lighter_order_book_sequence_gap = False
         self.lighter_snapshot_loaded = False
         self.lighter_order_book_lock = asyncio.Lock()
+        # EdgeX simple rate limit guard (2 ops / 2s -> ~1.1s min interval)
+        self.edgex_rate_limit_lock = asyncio.Lock()
+        self.edgex_last_op_time = 0.0
 
         # Lighter WebSocket state
         self.lighter_ws_task = None
@@ -562,6 +565,8 @@ class HedgeBot:
         best_bid, best_ask = await self.fetch_edgex_bbo_prices()
 
         # First attempt: EdgeX SDK helper (has its own retry)
+        # rate-limit: ensure spacing for EdgeX ops
+        await self._edgex_rate_limit_wait()
         order_result = await self.edgex_client.place_open_order(
             contract_id=self.edgex_contract_id,
             quantity=quantity,
@@ -586,6 +591,7 @@ class HedgeBot:
         if side == 'sell' and best_bid and price <= best_bid:
             price = best_bid + tick
 
+        await self._edgex_rate_limit_wait()
         fallback_result = await self.edgex_client.place_close_order(
             contract_id=self.edgex_contract_id,
             quantity=quantity,
@@ -597,7 +603,31 @@ class HedgeBot:
             return fallback_result.order_id, price
 
         last_error = fallback_result.error_message if hasattr(fallback_result, 'error_message') else 'Unknown error'
+        # If hit rate limit, wait a bit and retry once more
+        if isinstance(last_error, str) and 'rateLimit' in last_error:
+            self.logger.info("Hit EdgeX rate limit; waiting 6s and retrying fallback once")
+            await asyncio.sleep(6.0)
+            await self._edgex_rate_limit_wait()
+            retry_result = await self.edgex_client.place_close_order(
+                contract_id=self.edgex_contract_id,
+                quantity=quantity,
+                price=price,
+                side=side
+            )
+            if retry_result.success:
+                return retry_result.order_id, price
+            last_error = retry_result.error_message if hasattr(retry_result, 'error_message') else last_error
         raise Exception(f"Failed to place order after fallback: {last_error}")
+
+    async def _edgex_rate_limit_wait(self):
+        """Ensure EdgeX API call spacing to respect 2 ops / 2s (approx)."""
+        async with self.edgex_rate_limit_lock:
+            now = time.time()
+            min_interval = 6.0
+            delta = now - self.edgex_last_op_time
+            if delta < min_interval:
+                await asyncio.sleep(min_interval - delta)
+            self.edgex_last_op_time = time.time()
 
     async def place_edgex_post_only_order(self, side: str, quantity: Decimal):
         """Place a post-only order on EdgeX."""
