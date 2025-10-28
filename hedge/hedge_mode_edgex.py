@@ -264,6 +264,10 @@ class HedgeBot:
         self.lighter_base_url = "https://mainnet.zklighter.elliot.ai"
         self.account_index = int(os.getenv('LIGHTER_ACCOUNT_INDEX'))
         self.api_key_index = int(os.getenv('LIGHTER_API_KEY_INDEX'))
+        
+        # Position monitoring
+        self.last_position_check_time = 0
+        self.position_check_interval = 30  # 每30秒检查一次仓位
 
     def shutdown(self, signum=None, frame=None):
         """Graceful shutdown handler."""
@@ -338,6 +342,9 @@ class HedgeBot:
         try:
             order_data["avg_filled_price"] = (Decimal(order_data["filled_quote_amount"]) /
                                               Decimal(order_data["filled_base_amount"]))
+            # 记录更新前的Lighter仓位
+            old_lighter_position = self.lighter_position
+            
             if order_data["is_ask"]:
                 order_data["side"] = "SHORT"
                 self.lighter_position -= Decimal(order_data["filled_base_amount"]) 
@@ -345,6 +352,8 @@ class HedgeBot:
                 order_data["side"] = "LONG"
                 self.lighter_position += Decimal(order_data["filled_base_amount"]) 
 
+            # 记录Lighter仓位变化
+            self.logger.info(f"📊 Lighter position update: {old_lighter_position} -> {self.lighter_position} ({order_data['side']} {order_data['filled_base_amount']})")
             self.logger.info(f"📊 Lighter order filled: {order_data['side']} "
                              f"{order_data['filled_base_amount']} @ {order_data['avg_filled_price']}")
 
@@ -985,12 +994,18 @@ class HedgeBot:
         filled_size = Decimal(order_data.get('filled_size', '0'))
         price = Decimal(order_data.get('price', '0'))
 
+        # 记录更新前的仓位
+        old_position = self.edgex_position
+
         if side == 'buy':
             self.edgex_position += filled_size
             lighter_side = 'sell'
         else:
             self.edgex_position -= filled_size
             lighter_side = 'buy'
+
+        # 记录仓位变化
+        self.logger.info(f"📊 EdgeX position update: {old_position} -> {self.edgex_position} ({side} {filled_size})")
 
         self.current_lighter_side = lighter_side
         self.current_lighter_quantity = filled_size
@@ -1004,6 +1019,28 @@ class HedgeBot:
 
         self.waiting_for_lighter_fill = True
         self.logger.info(f"📋 Ready to place Lighter order: {lighter_side} {filled_size} @ {price}")
+
+    def check_position_balance(self):
+        """检查仓位平衡状态"""
+        total_position = self.edgex_position + self.lighter_position
+        self.logger.info(f"📊 Position Balance Check - EdgeX: {self.edgex_position} | Lighter: {self.lighter_position} | Total: {total_position}")
+        
+        if abs(total_position) > Decimal('0.1'):
+            self.logger.warning(f"⚠️ Position imbalance detected: {total_position}")
+            return False
+        return True
+
+    def validate_edgex_position(self):
+        """验证EdgeX仓位是否符合预期（应该保持多单）"""
+        if self.edgex_position < 0:
+            self.logger.error(f"🚨 CRITICAL: EdgeX position is negative (short): {self.edgex_position}")
+            self.logger.error(f"🚨 This should not happen! EdgeX should maintain long positions only")
+            return False
+        elif self.edgex_position > 0:
+            self.logger.info(f"✅ EdgeX position is positive (long): {self.edgex_position}")
+        else:
+            self.logger.info(f"ℹ️ EdgeX position is zero: {self.edgex_position}")
+        return True
 
     async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal, price: Decimal):
         if not self.lighter_client:
@@ -1091,10 +1128,8 @@ class HedgeBot:
                     order_type = "CLOSE"
 
                 if status == 'FILLED':
-                    if side == 'buy':
-                        self.edgex_position += filled_size
-                    else:
-                        self.edgex_position -= filled_size
+                    # 注意：仓位更新已经在handle_edgex_order_update中处理，这里不需要重复更新
+                    # 避免重复计算导致仓位错误
                     self.logger.info(f"[{order_id}] [{order_type}] [EdgeX] [{status}]: {filled_size} @ {price}")
                     self.edgex_order_status = status
                     if self.edgex_active_order_id == order_id:
@@ -1204,6 +1239,13 @@ class HedgeBot:
             self.logger.info(f"🔄 Trading loop iteration {iterations}")
             self.logger.info("-----------------------------------------------")
 
+            # 定期检查仓位平衡
+            current_time = time.time()
+            if current_time - self.last_position_check_time > self.position_check_interval:
+                self.check_position_balance()
+                self.validate_edgex_position()
+                self.last_position_check_time = current_time
+
             self.logger.info(f"[STEP 1] EdgeX position: {self.edgex_position} | Lighter position: {self.lighter_position}")
 
             if abs(self.edgex_position + self.lighter_position) > 0.2:
@@ -1239,15 +1281,27 @@ class HedgeBot:
                 break
 
             self.logger.info(f"[STEP 2] EdgeX position: {self.edgex_position} | Lighter position: {self.lighter_position}")
+            
+            # 验证EdgeX仓位
+            if not self.validate_edgex_position():
+                self.logger.error("🚨 CRITICAL: EdgeX position validation failed, stopping trading")
+                break
+            
             self.order_execution_complete = False
             self.waiting_for_lighter_fill = False
-            try:
-                side = 'sell'
-                await self.place_edgex_post_only_order(side, self.order_quantity)
-            except Exception as e:
-                self.logger.error(f"⚠️ Error in trading loop: {e}")
-                self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
-                break
+            
+            # STEP 2: 如果EdgeX有仓位，需要关仓（下卖单）
+            if self.edgex_position > 0:
+                try:
+                    side = 'sell'
+                    self.logger.info(f"[STEP 2] Closing EdgeX position: selling {self.edgex_position}")
+                    await self.place_edgex_post_only_order(side, self.edgex_position)
+                except Exception as e:
+                    self.logger.error(f"⚠️ Error in trading loop: {e}")
+                    self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
+                    break
+            else:
+                self.logger.info(f"[STEP 2] No EdgeX position to close, skipping")
 
             while not self.order_execution_complete and not self.stop_flag:
                 if self.waiting_for_lighter_fill:
@@ -1266,12 +1320,19 @@ class HedgeBot:
             self.logger.info(f"[STEP 3] EdgeX position: {self.edgex_position} | Lighter position: {self.lighter_position}")
             self.order_execution_complete = False
             self.waiting_for_lighter_fill = False
+            
+            # STEP 3: 最终仓位检查和清理
             if self.edgex_position == 0:
+                self.logger.info(f"[STEP 3] EdgeX position is zero, no action needed")
                 continue
             elif self.edgex_position > 0:
+                # EdgeX有多单，需要关仓
                 side = 'sell'
+                self.logger.info(f"[STEP 3] Final cleanup: selling {self.edgex_position} to close EdgeX position")
             else:
+                # EdgeX有空单，需要平仓
                 side = 'buy'
+                self.logger.info(f"[STEP 3] Final cleanup: buying {abs(self.edgex_position)} to close EdgeX short position")
 
             try:
                 await self.place_edgex_post_only_order(side, abs(self.edgex_position))
