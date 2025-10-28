@@ -118,6 +118,11 @@ class HedgeBot:
         self.edgex_rate_limit_lock = asyncio.Lock()
         self.edgex_last_op_time = 0.0
 
+        # EdgeX single-flight control
+        self.edgex_order_lock = asyncio.Lock()
+        self.edgex_active_order_id = None
+        self.edgex_active_side = None
+
         # Lighter WebSocket state
         self.lighter_ws_task = None
         self.lighter_order_result = None
@@ -573,6 +578,7 @@ class HedgeBot:
             direction=side.lower()
         )
         if order_result.success:
+            self.edgex_active_order_id = order_result.order_id
             return order_result.order_id, order_result.price
 
         # Fallback: place a single conservative maker price once (avoid rapid spam)
@@ -600,6 +606,8 @@ class HedgeBot:
         )
         if fallback_result.success:
             self.logger.info(f"[Fallback] EdgeX order accepted at {price} (single conservative attempt)")
+            self.edgex_active_order_id = fallback_result.order_id
+            self.edgex_active_side = side
             return fallback_result.order_id, price
 
         last_error = fallback_result.error_message if hasattr(fallback_result, 'error_message') else 'Unknown error'
@@ -615,9 +623,26 @@ class HedgeBot:
                 side=side
             )
             if retry_result.success:
+                self.edgex_active_order_id = retry_result.order_id
+                self.edgex_active_side = side
                 return retry_result.order_id, price
             last_error = retry_result.error_message if hasattr(retry_result, 'error_message') else last_error
         raise Exception(f"Failed to place order after fallback: {last_error}")
+
+    async def _wait_edgex_order_inactive(self, order_id: str, timeout: float = 10.0):
+        """Wait until the given order_id is no longer active (best-effort)."""
+        try:
+            start = time.time()
+            while time.time() - start < timeout:
+                await asyncio.sleep(0.2)
+                try:
+                    active = await self.edgex_client.get_active_orders(self.edgex_contract_id)
+                    if not any(o.order_id == order_id for o in active):
+                        return
+                except Exception:
+                    return
+        except Exception:
+            return
 
     async def _edgex_rate_limit_wait(self):
         """Ensure EdgeX API call spacing to respect 2 ops / 2s (approx)."""
@@ -634,9 +659,13 @@ class HedgeBot:
         if not self.edgex_client:
             raise Exception("EdgeX client not initialized")
 
+        if self.edgex_active_order_id is not None and (self.edgex_active_side == side):
+            await self._wait_edgex_order_inactive(self.edgex_active_order_id)
+
         self.edgex_order_status = None
         self.logger.info(f"[OPEN] [EdgeX] [{side}] Placing EdgeX POST-ONLY order")
-        order_id, order_price = await self.place_bbo_order(side, quantity)
+        async with self.edgex_order_lock:
+            order_id, order_price = await self.place_bbo_order(side, quantity)
 
         start_time = time.time()
         last_cancel_time = 0
@@ -647,7 +676,10 @@ class HedgeBot:
                 self.logger.info(f"Order {order_id} was canceled, will re-place after 5s")
                 self.edgex_order_status = None
                 await asyncio.sleep(5)
-                order_id, order_price = await self.place_bbo_order(side, quantity)
+                # ensure previous order fully inactive
+                await self._wait_edgex_order_inactive(order_id)
+                async with self.edgex_order_lock:
+                    order_id, order_price = await self.place_bbo_order(side, quantity)
                 start_time = time.time()
                 last_cancel_time = 0
                 await asyncio.sleep(0.5)
@@ -663,9 +695,10 @@ class HedgeBot:
 
                 should_cancel = False
                 if best_bid is not None and best_ask is not None:
-                    if side == 'buy' and order_price < best_bid:
+                    # Cancel only when our limit would cross the book and变为吃单
+                    if side == 'buy' and order_price >= best_ask:
                         should_cancel = True
-                    elif side == 'sell' and order_price > best_ask:
+                    elif side == 'sell' and order_price <= best_bid:
                         should_cancel = True
 
                 current_time = time.time()
@@ -677,8 +710,10 @@ class HedgeBot:
                         cancel_result = await self.edgex_client.cancel_order(order_id)
                         if cancel_result.success:
                             last_cancel_time = current_time
+                            await self._wait_edgex_order_inactive(order_id)
                             await asyncio.sleep(5)
-                            order_id, order_price = await self.place_bbo_order(side, quantity)
+                            async with self.edgex_order_lock:
+                                order_id, order_price = await self.place_bbo_order(side, quantity)
                             start_time = time.time()
                             continue
                         else:
@@ -693,9 +728,11 @@ class HedgeBot:
                             cancel_result = await self.edgex_client.cancel_order(order_id)
                             if cancel_result.success:
                                 last_cancel_time = current_time
+                                await self._wait_edgex_order_inactive(order_id)
                                 # wait 5s before re-placing a fresh post-only order at latest price
                                 await asyncio.sleep(5)
-                                order_id, order_price = await self.place_bbo_order(side, quantity)
+                                async with self.edgex_order_lock:
+                                    order_id, order_price = await self.place_bbo_order(side, quantity)
                                 # reset timer window after new order
                                 start_time = time.time()
                             else:
@@ -832,6 +869,8 @@ class HedgeBot:
                         self.edgex_position -= filled_size
                     self.logger.info(f"[{order_id}] [{order_type}] [EdgeX] [{status}]: {filled_size} @ {price}")
                     self.edgex_order_status = status
+                    if self.edgex_active_order_id == order_id:
+                        self.edgex_active_order_id = None
 
                     self.log_trade_to_csv(
                         exchange='EdgeX',
@@ -859,6 +898,9 @@ class HedgeBot:
                         self.edgex_order_status = "OPEN"
                     elif status in ['CANCELED', 'CANCELLED']:
                         self.edgex_order_status = status
+                        if self.edgex_active_order_id == order_id:
+                            self.edgex_active_order_id = None
+                            self.edgex_active_side = None
                     elif status in ['NEW', 'OPEN', 'PENDING', 'CANCELING']:
                         self.edgex_order_status = status
                     else:
