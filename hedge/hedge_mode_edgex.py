@@ -60,6 +60,8 @@ class TradingConfig:
     max_price_adjustments: int = 2
     rate_limit_interval: float = 6.0
     waiting_log_interval: float = 10.0
+    order_delay_seconds: int = 3  # 下单前等待时间
+    position_verify_delay: int = 2  # 下单后验证仓位前的等待时间
 
 
 @dataclass
@@ -268,6 +270,11 @@ class HedgeBot:
         # Position monitoring
         self.last_position_check_time = 0
         self.position_check_interval = 30  # 每30秒检查一次仓位
+        
+        # Order stability settings
+        self.order_delay_seconds = config.order_delay_seconds  # 下单前等待时间
+        self.position_verify_delay = config.position_verify_delay  # 下单后验证仓位前的等待时间
+        self.max_position_verify_attempts = 3  # 最大仓位验证尝试次数
 
     def shutdown(self, signum=None, frame=None):
         """Graceful shutdown handler."""
@@ -1042,6 +1049,102 @@ class HedgeBot:
             self.logger.info(f"ℹ️ EdgeX position is zero: {self.edgex_position}")
         return True
 
+    async def get_edgex_real_position(self) -> Decimal:
+        """获取EdgeX的真实持仓"""
+        try:
+            # EdgeX客户端的get_account_positions()直接返回Decimal值
+            real_position = await self.edgex_client.get_account_positions()
+            self.logger.info(f"📊 EdgeX real position from API: {real_position}")
+            return real_position
+        except Exception as e:
+            self.logger.error(f"❌ Error getting EdgeX real position: {e}")
+            self.logger.error(f"❌ Full traceback: {traceback.format_exc()}")
+            return self.edgex_position  # 返回跟踪的仓位作为fallback
+
+    async def determine_order_side(self) -> str:
+        """根据EdgeX真实持仓决定下单方向"""
+        real_position = await self.get_edgex_real_position()
+        
+        # 更新跟踪的仓位
+        if abs(real_position - self.edgex_position) > Decimal('0.001'):
+            self.logger.warning(f"⚠️ Position mismatch: tracked={self.edgex_position}, real={real_position}")
+            self.edgex_position = real_position
+        
+        if real_position > 0:
+            # 有持仓，需要下卖单关仓
+            self.logger.info(f"📊 EdgeX has position {real_position}, placing SELL order to close")
+            return 'sell'
+        else:
+            # 无持仓，下买单开仓
+            self.logger.info(f"📊 EdgeX has no position, placing BUY order to open")
+            return 'buy'
+
+    async def place_stable_edgex_order(self, side: str, quantity: Decimal):
+        """稳定的EdgeX下单方法，包含延迟和验证"""
+        self.logger.info(f"🔄 Preparing to place {side} order for {quantity} (stability mode)")
+        
+        # 下单前等待，确保系统稳定
+        self.logger.info(f"⏳ Waiting {self.order_delay_seconds}s before placing order for stability...")
+        await asyncio.sleep(self.order_delay_seconds)
+        
+        # 再次获取最新持仓，确保下单前的状态准确
+        pre_order_position = await self.get_edgex_real_position()
+        self.logger.info(f"📊 Pre-order position: {pre_order_position}")
+        
+        # 执行下单
+        try:
+            await self.place_edgex_post_only_order(side, quantity)
+            self.logger.info(f"✅ Order placed successfully: {side} {quantity}")
+        except Exception as e:
+            self.logger.error(f"❌ Failed to place order: {e}")
+            raise
+        
+        # 下单后等待，让订单处理完成
+        self.logger.info(f"⏳ Waiting {self.position_verify_delay}s for order to process...")
+        await asyncio.sleep(self.position_verify_delay)
+        
+        # 验证仓位变化
+        await self.verify_position_change(side, quantity, pre_order_position)
+
+    async def verify_position_change(self, side: str, expected_quantity: Decimal, pre_order_position: Decimal):
+        """验证下单后的仓位变化是否正确"""
+        for attempt in range(self.max_position_verify_attempts):
+            try:
+                current_position = await self.get_edgex_real_position()
+                self.logger.info(f"📊 Position verification attempt {attempt + 1}: {pre_order_position} -> {current_position}")
+                
+                # 计算预期的仓位变化
+                if side == 'buy':
+                    expected_position = pre_order_position + expected_quantity
+                else:  # sell
+                    expected_position = pre_order_position - expected_quantity
+                
+                # 检查仓位变化是否在合理范围内
+                position_diff = abs(current_position - expected_position)
+                if position_diff <= Decimal('0.001'):  # 允许0.001的误差
+                    self.logger.info(f"✅ Position change verified: {side} {expected_quantity} executed correctly")
+                    self.edgex_position = current_position
+                    return True
+                else:
+                    self.logger.warning(f"⚠️ Position change mismatch: expected {expected_position}, got {current_position}")
+                    
+                    if attempt < self.max_position_verify_attempts - 1:
+                        self.logger.info(f"⏳ Waiting 2s before retry...")
+                        await asyncio.sleep(2)
+                    else:
+                        self.logger.error(f"❌ Position verification failed after {self.max_position_verify_attempts} attempts")
+                        self.logger.error(f"❌ Expected: {expected_position}, Current: {current_position}")
+                        return False
+                        
+            except Exception as e:
+                self.logger.error(f"❌ Error during position verification: {e}")
+                if attempt < self.max_position_verify_attempts - 1:
+                    await asyncio.sleep(2)
+                else:
+                    return False
+        
+        return False
+
     async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal, price: Decimal):
         if not self.lighter_client:
             await self.initialize_lighter_client()
@@ -1254,9 +1357,21 @@ class HedgeBot:
 
             self.order_execution_complete = False
             self.waiting_for_lighter_fill = False
+            
+            # 根据EdgeX真实持仓决定下单方向
             try:
-                side = 'buy'
-                await self.place_edgex_post_only_order(side, self.order_quantity)
+                side = await self.determine_order_side()
+                if side == 'sell':
+                    # 如果是卖单，使用当前持仓数量
+                    quantity = self.edgex_position
+                    self.logger.info(f"[STEP 1] Placing {side} order with quantity {quantity} to close position")
+                else:
+                    # 如果是买单，使用配置的数量
+                    quantity = self.order_quantity
+                    self.logger.info(f"[STEP 1] Placing {side} order with quantity {quantity} to open position")
+                
+                # 使用稳定的下单方法
+                await self.place_stable_edgex_order(side, quantity)
             except Exception as e:
                 self.logger.error(f"⚠️ Error in trading loop: {e}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
@@ -1290,18 +1405,24 @@ class HedgeBot:
             self.order_execution_complete = False
             self.waiting_for_lighter_fill = False
             
-            # STEP 2: 如果EdgeX有仓位，需要关仓（下卖单）
-            if self.edgex_position > 0:
-                try:
-                    side = 'sell'
-                    self.logger.info(f"[STEP 2] Closing EdgeX position: selling {self.edgex_position}")
-                    await self.place_edgex_post_only_order(side, self.edgex_position)
-                except Exception as e:
-                    self.logger.error(f"⚠️ Error in trading loop: {e}")
-                    self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
-                    break
-            else:
-                self.logger.info(f"[STEP 2] No EdgeX position to close, skipping")
+            # STEP 2: 根据EdgeX真实持仓决定下单方向
+            try:
+                side = await self.determine_order_side()
+                if side == 'sell':
+                    # 如果是卖单，使用当前持仓数量
+                    quantity = self.edgex_position
+                    self.logger.info(f"[STEP 2] Placing {side} order with quantity {quantity} to close position")
+                else:
+                    # 如果是买单，使用配置的数量
+                    quantity = self.order_quantity
+                    self.logger.info(f"[STEP 2] Placing {side} order with quantity {quantity} to open position")
+                
+                # 使用稳定的下单方法
+                await self.place_stable_edgex_order(side, quantity)
+            except Exception as e:
+                self.logger.error(f"⚠️ Error in trading loop: {e}")
+                self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
+                break
 
             while not self.order_execution_complete and not self.stop_flag:
                 if self.waiting_for_lighter_fill:
@@ -1322,20 +1443,19 @@ class HedgeBot:
             self.waiting_for_lighter_fill = False
             
             # STEP 3: 最终仓位检查和清理
-            if self.edgex_position == 0:
-                self.logger.info(f"[STEP 3] EdgeX position is zero, no action needed")
-                continue
-            elif self.edgex_position > 0:
-                # EdgeX有多单，需要关仓
-                side = 'sell'
-                self.logger.info(f"[STEP 3] Final cleanup: selling {self.edgex_position} to close EdgeX position")
-            else:
-                # EdgeX有空单，需要平仓
-                side = 'buy'
-                self.logger.info(f"[STEP 3] Final cleanup: buying {abs(self.edgex_position)} to close EdgeX short position")
-
             try:
-                await self.place_edgex_post_only_order(side, abs(self.edgex_position))
+                side = await self.determine_order_side()
+                if side == 'sell':
+                    # 如果是卖单，使用当前持仓数量
+                    quantity = self.edgex_position
+                    self.logger.info(f"[STEP 3] Final cleanup: placing {side} order with quantity {quantity} to close position")
+                else:
+                    # 如果是买单，使用配置的数量
+                    quantity = self.order_quantity
+                    self.logger.info(f"[STEP 3] Final cleanup: placing {side} order with quantity {quantity} to open position")
+                
+                # 使用稳定的下单方法
+                await self.place_stable_edgex_order(side, quantity)
             except Exception as e:
                 self.logger.error(f"⚠️ Error in trading loop: {e}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
@@ -1389,6 +1509,10 @@ def parse_arguments():
                         help='Maximum price adjustments per order (default: 2)')
     parser.add_argument('--adjustment-threshold', type=int, default=5,
                         help='Price adjustment threshold in ticks (default: 5)')
+    parser.add_argument('--order-delay', type=int, default=3,
+                        help='Delay in seconds before placing EdgeX orders for stability (default: 3)')
+    parser.add_argument('--verify-delay', type=int, default=2,
+                        help='Delay in seconds before verifying position after order (default: 2)')
 
     return parser.parse_args()
 
@@ -1406,7 +1530,9 @@ def main():
         edgex_ttl_seconds=args.ttl,
         rate_limit_interval=args.rate_limit,
         max_price_adjustments=args.max_adjustments,
-        price_adjustment_threshold=args.adjustment_threshold
+        price_adjustment_threshold=args.adjustment_threshold,
+        order_delay_seconds=args.order_delay,
+        position_verify_delay=args.verify_delay
     )
     
     # Create and run bot
