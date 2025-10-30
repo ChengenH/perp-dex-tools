@@ -147,7 +147,6 @@ async def main():
 if __name__ == "__main__":
     sys.exit(asyncio.run(main()))
 
-
 # python3 -m venv env
 # source env/bin/activate
 # tmux new -s edgex
