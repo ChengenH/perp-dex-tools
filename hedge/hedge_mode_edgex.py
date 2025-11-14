@@ -234,7 +234,7 @@ class HedgeBot:
         self.logger.info("✅ edgeX client initialized successfully")
         return self.edgex_client
 
-    async def get_lighter_market_config(self) -> Tuple[int, int, int]:
+    async def get_lighter_market_config(self) -> Tuple[int, int, int, Decimal]:
         """Get Lighter market configuration."""
         url = f"{self.lighter_base_url}/api/v1/orderBooks"
         headers = {"accept": "application/json"}
@@ -1212,11 +1212,6 @@ class HedgeBot:
                 if time.time() - start_time2 > 180:
                     self.logger.error(f"❌ Timeout waiting for trade completion")
                     break
-
-            # Sleep after step 2
-            if self.sleep_time > 0:
-                self.logger.info(f"💤 Sleeping {self.sleep_time} seconds after STEP 2...")
-                await asyncio.sleep(self.sleep_time)
 
             # Close remaining position
             self.logger.info(

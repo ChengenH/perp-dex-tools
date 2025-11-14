@@ -15,19 +15,18 @@ from typing import Tuple
 from lighter.signer_client import SignerClient
 import sys
 import os
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from exchanges.extended import ExtendedClient
 import websockets
 from datetime import datetime
 import pytz
-import dotenv
-
-dotenv.load_dotenv()
 
 
 class Config:
     """Simple config class to wrap dictionary for Extended client."""
+
     def __init__(self, config_dict):
         for key, value in config_dict.items():
             setattr(self, key, value)
@@ -36,12 +35,14 @@ class Config:
 class HedgeBot:
     """Trading bot that places post-only orders on Extended and hedges with market orders on Lighter."""
 
-    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20):
+    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20,
+                 sleep_time: int = 0):
         self.ticker = ticker
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
         self.lighter_order_filled = False
         self.iterations = iterations
+        self.sleep_time = sleep_time
         self.extended_position = Decimal('0')
         self.lighter_position = Decimal('0')
         self.current_order = {}
@@ -318,9 +319,9 @@ class HedgeBot:
             raise Exception("Cannot calculate order price - missing order book data")
 
         if is_ask:
-            order_price = best_bid[0] + Decimal('0.1')
+            order_price = best_bid[0] + self.tick_size
         else:
-            order_price = best_ask[0] - Decimal('0.1')
+            order_price = best_ask[0] - self.tick_size
 
         return order_price
 
@@ -352,7 +353,8 @@ class HedgeBot:
 
                 async with websockets.connect(url) as ws:
                     # Subscribe to order book updates
-                    await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
+                    await ws.send(
+                        json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
 
                     # Subscribe to account orders updates
                     account_orders_channel = f"account_orders/{self.lighter_market_index}/{self.account_index}"
@@ -363,7 +365,8 @@ class HedgeBot:
                         ten_minutes_deadline = int(time.time() + 10 * 60)
                         auth_token, err = self.lighter_client.create_auth_token_with_expiry(ten_minutes_deadline)
                         if err is not None:
-                            self.logger.warning(f"⚠️ Failed to create auth token for account orders subscription: {err}")
+                            self.logger.warning(
+                                f"⚠️ Failed to create auth token for account orders subscription: {err}")
                         else:
                             auth_message = {
                                 "type": "subscribe",
@@ -398,7 +401,8 @@ class HedgeBot:
                                     order_book = data.get("order_book", {})
                                     if order_book and "offset" in order_book:
                                         self.lighter_order_book_offset = order_book["offset"]
-                                        self.logger.info(f"✅ Initial order book offset set to: {self.lighter_order_book_offset}")
+                                        self.logger.info(
+                                            f"✅ Initial order book offset set to: {self.lighter_order_book_offset}")
 
                                     # Debug: Log the structure of bids and asks
                                     bids = order_book.get("bids", [])
@@ -437,7 +441,8 @@ class HedgeBot:
 
                                     # Validate order book integrity after update
                                     if not self.validate_order_book_integrity():
-                                        self.logger.warning("🔄 Order book integrity check failed, requesting fresh snapshot...")
+                                        self.logger.warning(
+                                            "🔄 Order book integrity check failed, requesting fresh snapshot...")
                                         break
 
                                     # Get the best bid and ask levels
@@ -527,8 +532,10 @@ class HedgeBot:
 
     def initialize_extended_client(self):
         """Initialize the Extended client."""
-        if not all([self.extended_vault, self.extended_stark_key_private, self.extended_stark_key_public, self.extended_api_key]):
-            raise ValueError("EXTENDED_VAULT, EXTENDED_STARK_KEY_PRIVATE, EXTENDED_STARK_KEY_PUBLIC, and EXTENDED_API_KEY must be set in environment variables")
+        if not all([self.extended_vault, self.extended_stark_key_private, self.extended_stark_key_public,
+                    self.extended_api_key]):
+            raise ValueError(
+                "EXTENDED_VAULT, EXTENDED_STARK_KEY_PRIVATE, EXTENDED_STARK_KEY_PUBLIC, and EXTENDED_API_KEY must be set in environment variables")
 
         # Create config for Extended client
         config_dict = {
@@ -548,7 +555,7 @@ class HedgeBot:
         self.logger.info("✅ Extended client initialized successfully")
         return self.extended_client
 
-    def get_lighter_market_config(self) -> Tuple[int, int, int]:
+    def get_lighter_market_config(self) -> Tuple[int, int, int, Decimal]:
         """Get Lighter market configuration."""
         url = f"{self.lighter_base_url}/api/v1/orderBooks"
         headers = {"accept": "application/json"}
@@ -565,13 +572,20 @@ class HedgeBot:
             if "order_books" not in data:
                 raise Exception("Unexpected response format")
 
+            thisTicker = self.ticker
+            if self.ticker == "EUR":
+                thisTicker = "EUR" + "USD"
+
             for market in data["order_books"]:
-                if market["symbol"] == self.ticker:
+                if market["symbol"] == thisTicker:
+                    price_multiplier = pow(10, market["supported_price_decimals"])
                     return (market["market_id"],
                             pow(10, market["supported_size_decimals"]),
-                            pow(10, market["supported_price_decimals"]))
+                            price_multiplier,
+                            Decimal("1") / (Decimal("10") ** market["supported_price_decimals"])
+                            )
 
-            raise Exception(f"Ticker {self.ticker} not found")
+            raise Exception(f"in ext Ticker {thisTicker} not found")
 
         except Exception as e:
             self.logger.error(f"⚠️ Error getting market config: {e}")
@@ -639,7 +653,7 @@ class HedgeBot:
 
         start_time = time.time()
         last_cancel_time = 0
-        
+
         while not self.stop_flag:
             if self.extended_order_status in ['CANCELED', 'CANCELLED']:
                 self.logger.info(f"Order {order_id} was canceled, placing new order")
@@ -650,7 +664,7 @@ class HedgeBot:
                 await asyncio.sleep(0.5)
             elif self.extended_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'PARTIALLY_FILLED']:
                 await asyncio.sleep(0.5)
-                
+
                 # Check if we need to cancel and replace the order
                 should_cancel = False
                 if side == 'buy':
@@ -715,7 +729,7 @@ class HedgeBot:
                             # Fallback for array format [price, size]
                             price = Decimal(bid[0])
                             size = Decimal(bid[1])
-                        
+
                         if size > 0:
                             self.extended_order_book['bids'][price] = size
                         else:
@@ -732,7 +746,7 @@ class HedgeBot:
                             # Fallback for array format [price, size]
                             price = Decimal(ask[0])
                             size = Decimal(ask[1])
-                        
+
                         if size > 0:
                             self.extended_order_book['asks'][price] = size
                         else:
@@ -1042,7 +1056,7 @@ class HedgeBot:
 
             # Get contract info
             self.extended_contract_id, self.extended_tick_size = await self.get_extended_contract_info()
-            self.lighter_market_index, self.base_amount_multiplier, self.price_multiplier = self.get_lighter_market_config()
+            self.lighter_market_index, self.base_amount_multiplier, self.price_multiplier, self.tick_size = self.get_lighter_market_config()
 
             self.logger.info(f"Contract info loaded - Extended: {self.extended_contract_id}, "
                              f"Lighter: {self.lighter_market_index}")
@@ -1108,9 +1122,10 @@ class HedgeBot:
             self.logger.info(f"🔄 Trading loop iteration {iterations}")
             self.logger.info("-----------------------------------------------")
 
-            self.logger.info(f"[STEP 1] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
+            self.logger.info(
+                f"[STEP 1] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
 
-            if abs(self.extended_position + self.lighter_position) > 0.2:
+            if abs(self.extended_position + self.lighter_position) > self.order_quantity * 2:
                 self.logger.error(f"❌ Position diff is too large: {self.extended_position + self.lighter_position}")
                 break
 
@@ -1144,8 +1159,14 @@ class HedgeBot:
             if self.stop_flag:
                 break
 
+            # Sleep after step 1
+            if self.sleep_time > 0:
+                self.logger.info(f"💤 Sleeping {self.sleep_time} seconds after STEP 1...")
+                await asyncio.sleep(self.sleep_time)
+
             # Close position
-            self.logger.info(f"[STEP 2] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
+            self.logger.info(
+                f"[STEP 2] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
             self.order_execution_complete = False
             self.waiting_for_lighter_fill = False
             try:
@@ -1173,7 +1194,8 @@ class HedgeBot:
                     break
 
             # Close remaining position
-            self.logger.info(f"[STEP 3] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
+            self.logger.info(
+                f"[STEP 3] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
             self.order_execution_complete = False
             self.waiting_for_lighter_fill = False
             if self.extended_position == 0:
@@ -1233,5 +1255,7 @@ def parse_arguments():
                         help='Number of iterations to run')
     parser.add_argument('--fill-timeout', type=int, default=5,
                         help='Timeout in seconds for maker order fills (default: 5)')
+    parser.add_argument('--sleep', type=int, default=0,
+                        help='Sleep time in seconds after each step (default: 0)')
 
     return parser.parse_args()

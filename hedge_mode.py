@@ -150,7 +150,16 @@ if __name__ == "__main__":
 # python3 -m venv env
 # source env/bin/activate
 # tmux new -s edgex
-# python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 1000
+# python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 200
 #退出 Ctrl+B 然后 D
 #恢复 tmux attach -t edgex
 #杀掉进程  tmux kill-session -t edgex
+
+
+# python3 -m venv env
+# source env/bin/activate
+# tmux new -s ext
+# python hedge_mode.py --exchange extended --ticker ASTER --size 100 --sleep 620 --iter 100
+#退出 Ctrl+B 然后 D
+#恢复 tmux attach -t ext
+#杀掉进程  tmux kill-session -t ext

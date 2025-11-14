@@ -1,53 +1,61 @@
+# coding: utf-8
 """
-EdgeX exchange client implementation.
+Apex exchange client implementation.
 """
 
 import os
 import asyncio
 import json
+import time
 import traceback
+import types
 from decimal import Decimal
-from typing import Dict, Any, List, Optional, Tuple
-from edgex_sdk import Client, OrderSide, WebSocketManager, CancelOrderParams, GetOrderBookDepthParams, GetActiveOrderParams
+from typing import Dict, List, Optional, Tuple
+from apexomni import constants as apex_constants, FailedRequestError
+from apexomni._websocket_stream import _ApexWebSocketManager, PRIVATE_WSS
+from apexomni.http_private_sign import HttpPrivateSign
+from apexomni.websocket_api import WebSocket as ApexWebSocketClient
 
 from .base import BaseExchangeClient, OrderResult, OrderInfo, query_retry
 from helpers.logger import TradingLogger
 
 
-class EdgeXClient(BaseExchangeClient):
-    """EdgeX exchange client implementation."""
+class ApexClient(BaseExchangeClient):
+    """Apex exchange client implementation"""
 
-    def __init__(self, config: Dict[str, Any]):
-        """Initialize EdgeX client."""
+    def __init__(self, config: Dict[str, any]):
+        """Initialize Apex client."""
         super().__init__(config)
 
-        # EdgeX credentials from environment
-        self.account_id = os.getenv('EDGEX_ACCOUNT_ID')
-        self.stark_private_key = os.getenv('EDGEX_STARK_PRIVATE_KEY')
-        self.base_url = os.getenv('EDGEX_BASE_URL', 'https://pro.edgex.exchange')
-        self.ws_url = os.getenv('EDGEX_WS_URL', 'wss://quote.edgex.exchange')
+        # Apex credentials from environment
+        self.api_key = os.getenv('APEX_API_KEY')
+        self.api_key_passphrase = os.getenv('APEX_API_KEY_PASSPHRASE')
+        self.api_key_secret = os.getenv('APEX_API_KEY_SECRET')
+        self.omni_key_seed = os.getenv('APEX_OMNI_KEY_SEED')
+        self.api_key_credentials = {
+            'key': self.api_key, 'secret': self.api_key_secret,
+            'passphrase': self.api_key_passphrase
+        }
+        self.environment = os.getenv('APEX_ENVIRONMENT', 'prod')
 
-        if not self.account_id or not self.stark_private_key:
-            raise ValueError("EDGEX_ACCOUNT_ID and EDGEX_STARK_PRIVATE_KEY must be set in environment variables")
-
-        # Initialize EdgeX client using official SDK
-        self.client = Client(
-            base_url=self.base_url,
-            account_id=int(self.account_id),
-            stark_private_key=self.stark_private_key
-        )
-
-        # Initialize WebSocket manager using official SDK
-        self.ws_manager = WebSocketManager(
-            base_url=self.ws_url,
-            account_id=int(self.account_id),
-            stark_pri_key=self.stark_private_key
-        )
+        assert self.environment in {'prod', 'test'}, 'Apex environment can only be prod or test.'
+        if self.environment == 'prod':
+            self.http_base_url = apex_constants.APEX_OMNI_HTTP_MAIN
+            self.ws_base_url = apex_constants.APEX_OMNI_WS_MAIN
+            self.network_id = apex_constants.NETWORKID_OMNI_MAIN_ARB
+        else:
+            self.http_base_url = apex_constants.APEX_OMNI_HTTP_TEST
+            self.ws_base_url = apex_constants.APEX_OMNI_WS_TEST
+            self.network_id = apex_constants.NETWORKID_TEST
 
         # Initialize logger
-        self.logger = TradingLogger(exchange="edgex", ticker=self.config.ticker, log_to_console=False)
+        self.logger = TradingLogger(exchange="apex", ticker=self.config.ticker, log_to_console=False)
+
+        # Initialize Apex clients
+        self._initialize_apex_clients()
 
         self._order_update_handler = None
+        self.account_handler = None
 
         # --- reconnection state ---
         self._ws_task: Optional[asyncio.Task] = None
@@ -55,29 +63,49 @@ class EdgeXClient(BaseExchangeClient):
         self._ws_disconnected = asyncio.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+    def _initialize_apex_clients(self) -> None:
+        """Initialize Apex REST and Websocket clients"""
+        try:
+            self.rest_client = HttpPrivateSign(
+                self.http_base_url, network_id=self.network_id,
+                zk_seeds=self.omni_key_seed, zk_l2Key='',
+                api_key_credentials=self.api_key_credentials
+            )
+
+            # According to official SDK, need to request for user data first:
+            # https://github.com/ApeX-Protocol/apexpro-openapi/blob/main/README_V3.md#zkkey-sign-create-order-method
+            # This will store user info in HttpPrivateSign instance
+            self.rest_client.configs_v3()
+            self.rest_client.get_account_v3()
+
+            self.ws_client = ApexWebSocketClient(
+                endpoint=self.ws_base_url,
+                api_key_credentials=self.api_key_credentials
+            )
+        except Exception as e:
+            raise ValueError(f"Failed to initialize Apex client: {e}")
+
     def _validate_config(self) -> None:
-        """Validate EdgeX configuration."""
-        required_env_vars = ['EDGEX_ACCOUNT_ID', 'EDGEX_STARK_PRIVATE_KEY']
+        """Validate Apex configuration."""
+        required_env_vars = ['APEX_API_KEY', 'APEX_API_KEY_PASSPHRASE',
+                             'APEX_API_KEY_SECRET', 'APEX_OMNI_KEY_SEED']
         missing_vars = [var for var in required_env_vars if not os.getenv(var)]
         if missing_vars:
             raise ValueError(f"Missing required environment variables: {missing_vars}")
-
-    # ---------------------------
-    # Connection / Reconnect
-    # ---------------------------
+        return
 
     async def connect(self) -> None:
-        """Connect private WS and keep it alive with auto-reconnect."""
+        """Connect to Apex Websocket with auto-reconnect."""
         self._loop = asyncio.get_running_loop()
-
-        # Hook disconnect/connect once (SDK calls these from threads)
         try:
-            private_client = self.ws_manager.get_private_client()
-            private_client.on_disconnect(
-                lambda exc: self._loop.call_soon_threadsafe(self._ws_disconnected.set)
+            # Patch _on_close/_on_open (SDK did nothing but logging)
+            self.ws_client._on_close = types.MethodType(
+                lambda _: self._loop.call_soon_threadsafe(self._ws_disconnected.set),
+                self.ws_client
             )
-            private_client.on_connect(
-                lambda: self.logger.log("[WS] private connected", "INFO")
+            self.ws_client._on_open = types.MethodType(
+                lambda _: self.logger.log("[WS] connected", "INFO"),
+                self.ws_client
             )
         except Exception as e:
             self.logger.log(f"[WS] failed to set hooks: {e}", "ERROR")
@@ -85,38 +113,37 @@ class EdgeXClient(BaseExchangeClient):
         if not self._ws_task or self._ws_task.done():
             self._ws_task = asyncio.create_task(self._run_private_ws())
 
-        # give first connection a moment (optional)
-        await asyncio.sleep(0.5)
-
     async def _run_private_ws(self):
         """Tiny reconnect loop with exponential backoff."""
         backoff = 1.0
         while not self._ws_stop.is_set():
             try:
                 # connect
-                self.ws_manager.connect_private()
-                self.logger.log("[WS] connected", "INFO")
+                self.ws_client.ws_private = _ApexWebSocketManager(**self.ws_client.kwargs)
+                self.ws_client.ws_private._connect(self.ws_client.endpoint + PRIVATE_WSS)
+                self.ws_client.account_info_stream_v3(self.account_handler)
+                self.logger.log("[WS] private connected", "INFO")
                 backoff = 1.0
 
                 # wait until either disconnect or stop
                 self._ws_disconnected.clear()
                 done, _ = await asyncio.wait(
                     {asyncio.create_task(self._ws_stop.wait()),
-                    asyncio.create_task(self._ws_disconnected.wait()),},
+                     asyncio.create_task(self._ws_disconnected.wait()),},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if self._ws_stop.is_set():
                     break
 
                 self.logger.log(
-                    "[WS] disconnected; attempting to reconnect…", "WARNING"
+                    "[WS] disconnected; attempting to reconnect...", "WARNING"
                 )
             except Exception as e:
                 self.logger.log(f"[WS] connect error: {e}", "ERROR")
             finally:
                 # ensure socket is closed before retry
                 try:
-                    self.ws_manager.disconnect_private()
+                    self.ws_client.exit()
                 except Exception:
                     pass
 
@@ -126,12 +153,12 @@ class EdgeXClient(BaseExchangeClient):
 
         # Final cleanup (on stop)
         try:
-            self.ws_manager.disconnect_private()
+            self.ws_client.exit()
         except Exception:
             pass
 
     async def disconnect(self) -> None:
-        """Disconnect from EdgeX."""
+        """Disconnect from Apex."""
         try:
             self._ws_stop.set()
             if self._ws_task:
@@ -140,12 +167,12 @@ class EdgeXClient(BaseExchangeClient):
             pass
 
         try:
-            if hasattr(self, "client") and self.client:
-                await self.client.close()
-            if hasattr(self, "ws_manager"):
-                self.ws_manager.disconnect_all()
+            if hasattr(self, "private_rest_client") and self.rest_client:
+                self.rest_client._exit()
+            if hasattr(self, "ws_client"):
+                self.ws_client.exit()
         except Exception as e:
-            self.logger.log(f"Error during EdgeX disconnect: {e}", "ERROR")
+            self.logger.log(f"Error during Apex disconnect: {e}", "ERROR")
 
     # ---------------------------
     # Utility / Name
@@ -153,7 +180,7 @@ class EdgeXClient(BaseExchangeClient):
 
     def get_exchange_name(self) -> str:
         """Get the exchange name."""
-        return "edgex"
+        return "apex"
 
     # ---------------------------
     # WS Handlers
@@ -169,62 +196,55 @@ class EdgeXClient(BaseExchangeClient):
                 # Parse the message structure
                 if isinstance(message, str):
                     message = json.loads(message)
-
                 # Check if this is a trade-event with ORDER_UPDATE
-                content = message.get("content", {})
-                event = content.get("event", "")
-                if event == "ORDER_UPDATE":
-                    # Extract order data from the nested structure
-                    data = content.get('data', {})
-                    orders = data.get('order', [])
+                content = message.get("contents", {})
+                topic = message.get("topic", "")
+                if topic != "ws_zk_accounts_v3":
+                    return
+                # Extract order data from the nested structure
+                orders = content.get('orders', [])
 
-                    if orders and len(orders) > 0:
-                        order = orders[0]  # Get the first order
-                        if order.get('contractId') != self.config.contract_id:
-                            return
+                # on websocket starting, Apex will send the historical filled orders, could be confusing
+                if len(orders) > 1 and not content.get('fills'):
+                    return
 
-                        order_id = order.get('id')
-                        status = order.get('status')
-                        side = order.get('side', '').lower()
-                        filled_size = order.get('cumMatchSize')
+                if not orders:
+                    return
 
-                        if side == self.config.close_order_side:
-                            order_type = "CLOSE"
-                        else:
-                            order_type = "OPEN"
+                order = orders[0]  # Get the first order
+                if order.get('symbol') != self.config.contract_id:
+                    return
 
-                        # edgex returns TWO filled events for the same order; take the first one
-                        if status == "FILLED" and len(data.get('collateral', [])):
-                            return
+                order_id = order.get('id')
+                status = order.get('status')
+                side = order.get('side', '').lower()
+                filled_size = order.get('cumSuccessFillSize')
+                remaining_size = order.get('remainingSize')
 
-                        # ignore canceled close orders
-                        if status == "CANCELED" and order_type == "CLOSE":
-                            return
+                if side == self.config.close_order_side:
+                    order_type = "CLOSE"
+                else:
+                    order_type = "OPEN"
 
-                        # edgex returns partially filled events as "OPEN" orders
-                        if status == "OPEN" and Decimal(filled_size) > 0:
-                            status = "PARTIALLY_FILLED"
-
-                        if status in ['OPEN', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED']:
-                            if self._order_update_handler:
-                                self._order_update_handler({
-                                    'order_id': order_id,
-                                    'side': side,
-                                    'order_type': order_type,
-                                    'status': status,
-                                    'size': order.get('size'),
-                                    'price': order.get('price'),
-                                    'contract_id': order.get('contractId'),
-                                    'filled_size': filled_size
-                                })
+                if status in ['OPEN', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED']:
+                    if self._order_update_handler:
+                        self._order_update_handler({
+                            'order_id': order_id,
+                            'side': side,
+                            'order_type': order_type,
+                            'status': status,
+                            'size': order.get('size'),
+                            'price': order.get('price'),
+                            'contract_id': order.get('symbol'),
+                            'filled_size': filled_size
+                        })
 
             except Exception as e:
                 self.logger.log(f"Error handling order update: {e}", "ERROR")
                 self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
 
         try:
-            private_client = self.ws_manager.get_private_client()
-            private_client.on_message("trade-event", order_update_handler)
+            self.account_handler = order_update_handler
         except Exception as e:
             self.logger.log(f"Could not add trade-event handler: {e}", "ERROR")
 
@@ -234,30 +254,26 @@ class EdgeXClient(BaseExchangeClient):
 
     @query_retry(default_return=(0, 0))
     async def fetch_bbo_prices(self, contract_id: str) -> Tuple[Decimal, Decimal]:
-        depth_params = GetOrderBookDepthParams(contract_id=contract_id, limit=15)
-        order_book = await self.client.quote.get_order_book_depth(depth_params)
+        """Fetch best bid and ask price using official SDK"""
+        order_book = self.rest_client.depth_v3(symbol=contract_id)
         order_book_data = order_book['data']
 
-        # Get the first (and should be only) order book entry
-        order_book_entry = order_book_data[0]
-
         # Extract bids and asks from the entry
-        bids = order_book_entry.get('bids', [])
-        asks = order_book_entry.get('asks', [])
+        bids = order_book_data.get('b', [])
+        asks = order_book_data.get('a', [])
 
         # Best bid is the highest price someone is willing to buy at
-        best_bid = Decimal(bids[0]['price']) if bids and len(bids) > 0 else 0
+        best_bid = Decimal(max(bids, key=lambda x: Decimal(x[0]))[0])
         # Best ask is the lowest price someone is willing to sell at
-        best_ask = Decimal(asks[0]['price']) if asks and len(asks) > 0 else 0
+        best_ask = Decimal(min(asks, key=lambda x: Decimal(x[0]))[0])
         return best_bid, best_ask
 
     async def get_order_price(self, direction: str) -> Decimal:
-        """Get the price of an order with EdgeX using official SDK."""
+        """Get the price of an order with Apex using official SDK."""
         best_bid, best_ask = await self.fetch_bbo_prices(self.config.contract_id)
         if best_bid <= 0 or best_ask <= 0:
             self.logger.log("Invalid bid/ask prices", "ERROR")
             raise ValueError("Invalid bid/ask prices")
-
 
         if direction == 'buy':
             # For buy orders, place slightly below best ask to ensure execution
@@ -268,7 +284,7 @@ class EdgeXClient(BaseExchangeClient):
         return self.round_to_tick(order_price)
 
     async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
-        """Place an open order with EdgeX using official SDK with retry logic for POST_ONLY rejections."""
+        """Place an open order with Apex using official SDK with retry logic for POST_ONLY rejections."""
         max_retries = 15
         retry_count = 0
 
@@ -282,26 +298,28 @@ class EdgeXClient(BaseExchangeClient):
                 if direction == 'buy':
                     # For buy orders, place slightly below best ask to ensure execution
                     order_price = best_ask - self.config.tick_size
-                    side = OrderSide.BUY
+                    side = 'buy'
                 else:
                     # For sell orders, place slightly above best bid to ensure execution
                     order_price = best_bid + self.config.tick_size
-                    side = OrderSide.SELL
+                    side = 'sell'
 
                 # Place the order using official SDK (post-only to ensure maker order)
-                order_result = await self.client.create_limit_order(
-                    contract_id=contract_id,
+                order_result = self.rest_client.create_order_v3(
+                    symbol=contract_id,
                     size=str(quantity),
                     price=str(self.round_to_tick(order_price)),
-                    side=side,
-                    post_only=True
+                    side=side.upper(),
+                    type='LIMIT',
+                    timestampSeconds=time.time(),
+                    timeInForce='POST_ONLY',
                 )
 
                 if not order_result or 'data' not in order_result:
                     return OrderResult(success=False, error_message='Failed to place order')
 
                 # Extract order ID from response
-                order_id = order_result['data'].get('orderId')
+                order_id = order_result['data'].get('id')
                 if not order_id:
                     return OrderResult(success=False, error_message='No order ID in response')
 
@@ -316,12 +334,12 @@ class EdgeXClient(BaseExchangeClient):
                             continue
                         else:
                             return OrderResult(success=False, error_message=f'Order rejected after {max_retries} attempts')
-                    elif order_info.status in ['OPEN', 'PARTIALLY_FILLED', 'FILLED']:
+                    elif order_info.status in ['OPEN', 'PENDING', 'PARTIALLY_FILLED', 'FILLED']:
                         # Order successfully placed
                         return OrderResult(
                             success=True,
                             order_id=order_id,
-                            side=side.value,
+                            side=side,
                             size=quantity,
                             price=order_price,
                             status=order_info.status
@@ -333,7 +351,7 @@ class EdgeXClient(BaseExchangeClient):
                     return OrderResult(
                         success=True,
                         order_id=order_id,
-                        side=side.value,
+                        side=side,
                         size=quantity,
                         price=order_price,
                         status='OPEN'
@@ -350,7 +368,7 @@ class EdgeXClient(BaseExchangeClient):
         return OrderResult(success=False, error_message='Max retries exceeded')
 
     async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
-        """Place a close order with EdgeX using official SDK with retry logic for POST_ONLY rejections."""
+        """Place a close order with Apex using official SDK with retry logic for POST_ONLY rejections."""
         max_retries = 15
         retry_count = 0
 
@@ -360,9 +378,6 @@ class EdgeXClient(BaseExchangeClient):
 
                 if best_bid <= 0 or best_ask <= 0:
                     return OrderResult(success=False, error_message='Invalid bid/ask prices')
-
-                # Convert side string to OrderSide enum
-                order_side = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
 
                 # Adjust order price based on market conditions and side
                 adjusted_price = price
@@ -378,19 +393,21 @@ class EdgeXClient(BaseExchangeClient):
 
                 adjusted_price = self.round_to_tick(adjusted_price)
                 # Place the order using official SDK (post-only to avoid taker fees)
-                order_result = await self.client.create_limit_order(
-                    contract_id=contract_id,
+                order_result = self.rest_client.create_order_v3(
+                    symbol=contract_id,
                     size=str(quantity),
                     price=str(adjusted_price),
-                    side=order_side,
-                    post_only=True
+                    side=side.upper(),
+                    type='LIMIT',
+                    timestampSeconds=time.time(),
+                    timeInForce='POST_ONLY',
                 )
 
                 if not order_result or 'data' not in order_result:
                     return OrderResult(success=False, error_message='Failed to place order')
 
                 # Extract order ID from response
-                order_id = order_result['data'].get('orderId')
+                order_id = order_result['data'].get('id')
                 if not order_id:
                     return OrderResult(success=False, error_message='No order ID in response')
 
@@ -405,7 +422,7 @@ class EdgeXClient(BaseExchangeClient):
                             continue
                         else:
                             return OrderResult(success=False, error_message=f'Close order rejected after {max_retries} attempts')
-                    elif order_info.status in ['OPEN', 'PARTIALLY_FILLED', 'FILLED']:
+                    elif order_info.status in ['OPEN', 'PENDING', 'PARTIALLY_FILLED', 'FILLED']:
                         # Order successfully placed
                         return OrderResult(
                             success=True,
@@ -438,96 +455,89 @@ class EdgeXClient(BaseExchangeClient):
         return OrderResult(success=False, error_message='Max retries exceeded for close order')
 
     async def cancel_order(self, order_id: str) -> OrderResult:
-        """Cancel an order with EdgeX using official SDK."""
+        """Cancel an order with Apex using official SDK."""
         try:
-            # Create cancel parameters using official SDK
-            cancel_params = CancelOrderParams(order_id=order_id)
-
             # Cancel the order using official SDK
-            cancel_result = await self.client.cancel_order(cancel_params)
+            cancel_result = self.rest_client.delete_order_v3(id=order_id)
 
             if not cancel_result or 'data' not in cancel_result:
                 return OrderResult(success=False, error_message='Failed to cancel order')
 
             return OrderResult(success=True)
-
+        except FailedRequestError as e:
+            # Apex's API return non-JSON response when trying to cancel a filled order
+            if 'Could not decode JSON' in e.message:
+                return OrderResult(success=False, error_message='Order has been filled')
+            else:
+                return OrderResult(success=False, error_message=e.message)
         except Exception as e:
             return OrderResult(success=False, error_message=str(e))
 
     @query_retry()
     async def get_order_info(self, order_id: str) -> Optional[OrderInfo]:
-        """Get order information from EdgeX using official SDK."""
-        # Use the newly created get_order_by_id method
-        order_result = await self.client.order.get_order_by_id(order_id_list=[order_id])
-
+        """Get order information from Apex using official SDK."""
+        order_result = self.rest_client.get_order_v3(id=order_id)
         if not order_result or 'data' not in order_result:
             return None
 
-        # The API returns a list of orders, get the first (and should be only) one
-        order_list = order_result['data']
-        if order_list and len(order_list) > 0:
-            order_data = order_list[0]
-            return OrderInfo(
-                order_id=order_data.get('id', ''),
-                side=order_data.get('side', '').lower(),
-                size=Decimal(order_data.get('size', 0)),
-                price=Decimal(order_data.get('price', 0)),
-                status=order_data.get('status', ''),
-                filled_size=Decimal(order_data.get('cumMatchSize', 0)),
-                remaining_size=Decimal(order_data.get('size', 0)) - Decimal(order_data.get('cumMatchSize', 0))
-            )
-
-        return None
+        order_data = order_result['data']
+        return OrderInfo(
+            order_id=order_data.get('id', ''),
+            side=order_data.get('side', '').lower(),
+            size=Decimal(order_data.get('size', 0)),
+            price=Decimal(order_data.get('price', 0)),
+            status=order_data.get('status', ''),
+            filled_size=Decimal(order_data.get('cumSuccessFillSize', 0)),
+            remaining_size=Decimal(order_data.get('size', 0)) - Decimal(order_data.get('cumSuccessFillSize', 0))
+        )
 
     @query_retry(default_return=[])
     async def get_active_orders(self, contract_id: str) -> List[OrderInfo]:
-        """Get active orders for a contract using official SDK."""
+        """Get active orders for a symbol using official SDK."""
         # Get active orders using official SDK
-        params = GetActiveOrderParams(size="200", offset_data="", filter_contract_id_list=[contract_id])
-        active_orders = await self.client.get_active_orders(params)
+        active_orders = self.rest_client.open_orders_v3()
 
         if not active_orders or 'data' not in active_orders:
             return []
 
         # Filter orders for the specific contract and ensure they are dictionaries
         # The API returns orders under 'dataList' key, not 'orderList'
-        order_list = active_orders['data'].get('dataList', [])
+        order_list = active_orders['data']
         contract_orders = []
 
         for order in order_list:
-            if isinstance(order, dict) and order.get('contractId') == contract_id:
+            if isinstance(order, dict) and order.get('symbol') == contract_id:
                 contract_orders.append(OrderInfo(
                     order_id=order.get('id', ''),
                     side=order.get('side', '').lower(),
                     size=Decimal(order.get('size', 0)),
                     price=Decimal(order.get('price', 0)),
                     status=order.get('status', ''),
-                    filled_size=Decimal(order.get('cumMatchSize', 0)),
-                    remaining_size=Decimal(order.get('size', 0)) - Decimal(order.get('cumMatchSize', 0))
+                    filled_size=Decimal(order.get('cumSuccessFillSize', 0)),
+                    remaining_size=Decimal(order.get('size', 0)) - Decimal(order.get('cumSuccessFillSize', 0))
                 ))
-
         return contract_orders
 
     @query_retry(default_return=0)
     async def get_account_positions(self) -> Decimal:
         """Get account positions using official SDK."""
-        positions_data = await self.client.get_account_positions()
-        if not positions_data or 'data' not in positions_data:
+        account_data = self.rest_client.get_account_v3()
+        if not account_data or 'positions' not in account_data:
             self.logger.log("No positions or failed to get positions", "WARNING")
             position_amt = 0
         else:
             # The API returns positions under data.positionList
-            positions = positions_data.get('data', {}).get('positionList', [])
+            positions = account_data.get('positions', [])
             if positions:
                 # Find position for current contract
                 position = None
                 for p in positions:
-                    if isinstance(p, dict) and p.get('contractId') == self.config.contract_id:
+                    if isinstance(p, dict) and p.get('symbol') == self.config.contract_id:
                         position = p
                         break
 
                 if position:
-                    position_amt = abs(Decimal(position.get('openSize', 0)))
+                    position_amt = abs(Decimal(position.get('size', 0)))
                 else:
                     position_amt = 0
             else:
@@ -541,20 +551,20 @@ class EdgeXClient(BaseExchangeClient):
             self.logger.log("Ticker is empty", "ERROR")
             raise ValueError("Ticker is empty")
 
-        response = await self.client.get_metadata()
+        response = self.rest_client.configs_v3(symbol=ticker)
         data = response.get('data', {})
         if not data:
             self.logger.log("Failed to get metadata", "ERROR")
             raise ValueError("Failed to get metadata")
 
-        contract_list = data.get('contractList', [])
+        contract_list = data.get('contractConfig', {}).get('perpetualContract', [])
         if not contract_list:
             self.logger.log("Failed to get contract list", "ERROR")
             raise ValueError("Failed to get contract list")
 
         current_contract = None
         for c in contract_list:
-            if c.get('contractName') == ticker+'USD':
+            if c.get('crossSymbolName') == ticker + 'USDT':
                 current_contract = c
                 break
 
@@ -562,7 +572,7 @@ class EdgeXClient(BaseExchangeClient):
             self.logger.log("Failed to get contract ID for ticker", "ERROR")
             raise ValueError("Failed to get contract ID for ticker")
 
-        self.config.contract_id = current_contract.get('contractId')
+        self.config.contract_id = current_contract.get('symbol')
         min_quantity = Decimal(current_contract.get('minOrderSize'))
         if self.config.quantity < min_quantity:
             self.logger.log(f"Order quantity is less than min quantity: {self.config.quantity} < {min_quantity}", "ERROR")
